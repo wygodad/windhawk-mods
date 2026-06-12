@@ -2,7 +2,7 @@
 // @id              tray-hover-expand
 // @name            Tray hover expand
 // @description     Open the hidden tray icons flyout on hover instead of clicking the chevron; optionally collapse it when the cursor leaves
-// @version         1.4.0
+// @version         1.4.1
 // @author          wygodad
 // @github          https://github.com/wygodad
 // @include         windhawk.exe
@@ -340,6 +340,8 @@ static DWORD WINAPI WorkerThread(LPVOID) {
     ULONGLONG nextIdleStateCheck = 0;
     ULONGLONG lastOpenAt = 0;
     bool overBtnPrev = false;
+    bool clickedInFlyout = false;
+    bool anyBtnDownPrev = false;
 
     while (g_running) {
         ULONGLONG now = GetTickCount64();
@@ -409,8 +411,26 @@ static DWORD WINAPI WorkerThread(LPVOID) {
             }
             overBtnPrev = overBtn;
 
+            // Detect a click inside the flyout: the user is interacting with
+            // an icon (e.g. its popup window just opened and took focus).
+            // Suspend auto-collapse until the flyout closes on its own —
+            // collapsing via Invoke would steal focus and dismiss the popup
+            // the user just opened.
+            bool anyBtnDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) ||
+                              (GetAsyncKeyState(VK_RBUTTON) & 0x8000) ||
+                              (GetAsyncKeyState(VK_MBUTTON) & 0x8000);
+            if (anyBtnDown && !anyBtnDownPrev && flyoutVisible &&
+                CursorOverFlyout(pt, s)) {
+                clickedInFlyout = true;
+                Wh_Log(L"Click inside flyout: auto-collapse suspended");
+            }
+            anyBtnDownPrev = anyBtnDown;
+            if (!flyoutVisible && !cooling) {
+                clickedInFlyout = false;
+            }
+
             // Auto-collapse once the cursor left both the button and the flyout.
-            if (s.autoClose && flyoutVisible && !cooling) {
+            if (s.autoClose && flyoutVisible && !cooling && !clickedInFlyout) {
                 bool overFlyout = CursorOverFlyout(pt, s);
                 if (overBtn || overFlyout) {
                     leftAt = 0;

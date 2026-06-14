@@ -2,7 +2,7 @@
 // @id              mouse-button-remap
 // @name            Mouse Button Remapper
 // @description     Remap mouse buttons (side, middle, left, right) to keyboard keys with optional modifiers, double-click actions, a master toggle hotkey and game mode
-// @version         1.6.0
+// @version         1.7.2
 // @author          wygodad
 // @github          https://github.com/wygodad
 // @include         windhawk.exe
@@ -32,6 +32,24 @@ simply configure the other one.
 The mod runs as a tool mod in a dedicated process and installs a global
 low-level mouse hook, so it works system-wide (in every application)
 without injecting into the shell or other programs.
+
+## Mouse compatibility
+
+By default, on virtually all mice the two side buttons are reported as
+standard mouse buttons — **Forward** (XButton2) and **Back** (XButton1) —
+and the middle button as the wheel click. Those are exactly the events
+this mod intercepts, so it works out of the box on a normal mouse with no
+vendor software.
+
+However, if the mouse's own software or onboard firmware remaps a button
+to a **multimedia or keyboard function** (e.g. "Refresh", "Play/Pause",
+"Browser Back"), that press is no longer sent as a mouse button — it
+arrives as a media/keyboard command that a mouse hook cannot see, so this
+mod can no longer remap it. If a button is not being intercepted, open
+your mouse software and set it back to the plain **Forward** / **Back** /
+**Wheel click** function, then assign the keyboard key here in the mod.
+In other words: let the mouse send a normal button, and let the mod do
+the remapping — do not remap the same button in both places.
 
 ## Configuration
 
@@ -89,7 +107,9 @@ combination is already taken by another application, the registration
 fails and a note is written to the mod's log — just pick a different
 combination. Every toggle shows a short on-screen indicator
 ("Mouse remap: ON/OFF"); a confirmation sound can be enabled with the
-"Play a sound on toggle" option. Remapping always starts active after
+"Play a sound on toggle" option. The indicator scales with the screen
+and appears on the monitor under the cursor, so it stays readable on
+large / high-resolution displays. Remapping always starts active after
 the mod (re)starts.
 
 **Troubleshooting:** if pressing the shortcut only produces a plain
@@ -103,6 +123,11 @@ already owns that combination; pick a different one and save again.
 When enabled, remapping is automatically suspended while the foreground
 window covers the entire screen — typical for games and fullscreen
 video. Note that this also applies to browsers in fullscreen (F11) mode.
+
+The fullscreen state is tracked efficiently: instead of being recomputed
+inside the mouse hook on every click, it is cached and only refreshed via
+window events (foreground change and window move/resize) while game mode
+is enabled, so the hook stays lightweight.
 
 ## ⚠️ Warning: left and right button
 
@@ -125,6 +150,24 @@ boczny** (Do przodu / XButton2), **dolny boczny** (Wstecz / XButton1),
 **prawy**. Mod działa jako „tool mod" w osobnym procesie i instaluje
 globalny hook myszy, więc działa we wszystkich aplikacjach bez
 wstrzykiwania się do powłoki ani innych programów.
+
+## Zgodność myszek
+
+Domyślnie w praktycznie każdej myszce dwa boczne przyciski są zgłaszane
+jako standardowe przyciski myszy — **Do przodu** (XButton2) i **Wstecz**
+(XButton1) — a środkowy jako klik kółka. Dokładnie te zdarzenia mod
+przechwytuje, więc na zwykłej myszce bez oprogramowania działa od razu.
+
+Jeśli jednak oprogramowanie myszki lub jej firmware przypisze przyciskowi
+**funkcję multimedialną lub klawiaturową** (np. „Refresh", „Play/Pause",
+„Wstecz przeglądarki"), takie naciśnięcie nie jest już wysyłane jako
+przycisk myszy — przychodzi jako komenda multimedialna/klawiatury, której
+hook myszy nie widzi, więc mod nie może go przemapować. Jeśli któryś
+przycisk nie jest przechwytywany, w oprogramowaniu myszki ustaw go z
+powrotem na zwykłe **Do przodu** / **Wstecz** / **klik kółka**, a klawisz
+przypisz tutaj w modzie. Krótko: niech myszka wysyła normalny przycisk, a
+przemapowaniem zajmie się mod — nie mapuj tego samego przycisku w obu
+miejscach naraz.
 
 ## Konfiguracja
 
@@ -179,8 +222,10 @@ list — jeśli kombinacja jest już zajęta przez inny program, rejestracja
 się nie powiedzie, a informacja trafi do logu moda — wystarczy wybrać
 inną kombinację. Każde przełączenie pokazuje krótki wskaźnik na ekranie
 ("Mouse remap: ON/OFF"); dźwięk potwierdzenia można włączyć opcją
-„Odtwarzaj dźwięk przy przełączeniu". Po (re)starcie moda bindy są
-zawsze aktywne.
+„Odtwarzaj dźwięk przy przełączeniu". Wskaźnik skaluje się do rozmiaru
+ekranu i pojawia się na monitorze pod kursorem, więc pozostaje czytelny
+na dużych ekranach i wysokiej rozdzielczości. Po (re)starcie moda bindy
+są zawsze aktywne.
 
 **Rozwiązywanie problemów:** jeśli naciśnięcie skrótu daje tylko zwykły
 systemowy „ding" i wskaźnik się nie pokazuje, skrót nie został
@@ -193,6 +238,11 @@ inna aplikacja; wybierz inną i zapisz ponownie.
 Gdy włączony, bindy są automatycznie wstrzymywane, dopóki okno na
 pierwszym planie zajmuje cały ekran — typowe dla gier i pełnoekranowego
 wideo. Uwaga: dotyczy to też przeglądarki w trybie pełnoekranowym (F11).
+
+Stan pełnego ekranu jest śledzony wydajnie: zamiast przeliczać go w haku
+myszy przy każdym kliknięciu, jest buforowany i odświeżany tylko przez
+zdarzenia okien (zmiana aktywnego okna oraz zmiana rozmiaru/pozycji),
+i tylko gdy tryb gry jest włączony — dzięki czemu hak pozostaje lekki.
 
 ## ⚠️ Ostrzeżenie: lewy i prawy przycisk
 
@@ -1426,6 +1476,16 @@ HHOOK g_hook;
 HANDLE g_hookThread;
 DWORD g_hookThreadId;
 
+// Cached "the foreground window is fullscreen" state for game mode. Computing it
+// inside the low-level mouse hook on every click would add work to a global,
+// latency-sensitive callback, so it is recomputed on the hook thread only when
+// the relevant window events fire (see WinEventProc) and merely read in the
+// hook. Both the WinEvent callback and the mouse hook run on the hook thread; it
+// is kept atomic to document the cross-callback sharing.
+// Caching approach suggested by @m417z during code review.
+std::atomic<bool> g_foregroundFullscreen{false};
+HWINEVENTHOOK g_winEventHooks[2];
+
 // On-screen indicator shown when the toggle hotkey fires. Lives on the
 // hook thread, which also dispatches its WM_PAINT/WM_TIMER messages.
 HWND g_osdWnd;
@@ -1657,6 +1717,28 @@ bool IsForegroundFullscreen() {
            windowRect.bottom >= monitorInfo.rcMonitor.bottom;
 }
 
+// Recomputes the cached fullscreen state. Runs on the hook thread (from the
+// WinEvent callback and when game mode is first enabled).
+void RecomputeForegroundFullscreen() {
+    g_foregroundFullscreen.store(IsForegroundFullscreen(),
+                                 std::memory_order_relaxed);
+}
+
+// Refreshes the cache when the foreground window changes or a top-level window
+// moves/resizes (e.g. a browser entering or leaving F11 fullscreen). Delivered
+// to the hook thread's message loop (WINEVENT_OUTOFCONTEXT).
+void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
+                           LONG, DWORD, DWORD) {
+    if (event == EVENT_OBJECT_LOCATIONCHANGE) {
+        // Ignore the constant stream of cursor/caret location changes; react
+        // only to a top-level window's own bounds changing.
+        if (idObject != OBJID_WINDOW || hwnd != GetForegroundWindow()) {
+            return;
+        }
+    }
+    RecomputeForegroundFullscreen();
+}
+
 // Fires when no second click arrived within the double-click interval —
 // performs the delayed single-click action. Runs on the hook thread.
 void CALLBACK SingleClickTimerProc(HWND, UINT, UINT_PTR id, DWORD) {
@@ -1693,7 +1775,8 @@ bool HandleButtonDown(int button) {
     if (!config.single.vk && !(config.dblEnabled && config.dbl.vk)) {
         return false;
     }
-    if (g_hookSettings.gameMode && IsForegroundFullscreen()) {
+    if (g_hookSettings.gameMode &&
+        g_foregroundFullscreen.load(std::memory_order_relaxed)) {
         return false;
     }
 
@@ -1770,10 +1853,43 @@ void ShowOsd(PCWSTR text) {
         DestroyWindow(g_osdWnd);
     }
 
-    const int width = 280;
-    const int height = 64;
-    int x = (GetSystemMetrics(SM_CXSCREEN) - width) / 2;
-    int y = 96;
+    // Show on the monitor under the cursor and scale everything with that
+    // monitor's height, so the indicator stays readable on large / high-
+    // resolution displays instead of being a tiny fixed-size popup.
+    POINT cursor;
+    GetCursorPos(&cursor);
+    MONITORINFO mi{sizeof(mi)};
+    GetMonitorInfo(MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY), &mi);
+    int screenW = mi.rcMonitor.right - mi.rcMonitor.left;
+    int screenH = mi.rcMonitor.bottom - mi.rcMonitor.top;
+
+    int fontHeight = screenH / 36;
+    if (fontHeight < 20) {
+        fontHeight = 20;
+    }
+
+    if (g_osdFont) {
+        DeleteObject(g_osdFont);
+    }
+    g_osdFont = CreateFont(-fontHeight, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE,
+                           FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                           CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                           DEFAULT_PITCH, L"Segoe UI");
+
+    // Size the window around the measured text.
+    SIZE textSize{};
+    HDC dc = GetDC(nullptr);
+    HGDIOBJ oldFont = SelectObject(dc, g_osdFont);
+    GetTextExtentPoint32(dc, text, (int)wcslen(text), &textSize);
+    SelectObject(dc, oldFont);
+    ReleaseDC(nullptr, dc);
+
+    int padX = fontHeight;
+    int padY = fontHeight * 2 / 3;
+    int width = textSize.cx + padX * 2;
+    int height = textSize.cy + padY * 2;
+    int x = mi.rcMonitor.left + (screenW - width) / 2;
+    int y = mi.rcMonitor.top + screenH / 11;
 
     g_osdWnd = CreateWindowEx(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED |
@@ -1879,6 +1995,36 @@ void UpdateHotkeyRegistration() {
     }
 }
 
+// Starts/stops foreground tracking so the cached fullscreen state is kept up to
+// date only while game mode is enabled. Runs on the hook thread.
+void UpdateGameModeTracking() {
+    RefreshHookSettings();
+    bool wanted = g_hookSettings.gameMode;
+    bool active = g_winEventHooks[0] != nullptr;
+    if (wanted == active) {
+        return;
+    }
+    if (wanted) {
+        g_winEventHooks[0] = SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr,
+            WinEventProc, 0, 0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+        g_winEventHooks[1] = SetWinEventHook(
+            EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, nullptr,
+            WinEventProc, 0, 0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+        RecomputeForegroundFullscreen();  // prime the cache
+    } else {
+        for (HWINEVENTHOOK& h : g_winEventHooks) {
+            if (h) {
+                UnhookWinEvent(h);
+                h = nullptr;
+            }
+        }
+        g_foregroundFullscreen.store(false, std::memory_order_relaxed);
+    }
+}
+
 DWORD WINAPI HookThreadProc(LPVOID) {
     g_hook = SetWindowsHookEx(WH_MOUSE_LL, LowLevelMouseProc,
                               GetModuleHandle(nullptr), 0);
@@ -1888,10 +2034,8 @@ DWORD WINAPI HookThreadProc(LPVOID) {
     }
 
     g_osdBrush = CreateSolidBrush(RGB(28, 28, 28));
-    g_osdFont = CreateFont(-22, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-                           DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                           CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                           DEFAULT_PITCH, L"Segoe UI");
+    // The OSD font is (re)created per show in ShowOsd so it can scale with the
+    // current screen.
     WNDCLASS wc{};
     wc.lpfnWndProc = OsdWndProc;
     wc.hInstance = GetModuleHandle(nullptr);
@@ -1900,6 +2044,7 @@ DWORD WINAPI HookThreadProc(LPVOID) {
     RegisterClass(&wc);
 
     UpdateHotkeyRegistration();
+    UpdateGameModeTracking();
 
     MSG msg;
     while (GetMessage(&msg, nullptr, 0, 0) > 0) {
@@ -1911,6 +2056,7 @@ DWORD WINAPI HookThreadProc(LPVOID) {
             }
             if (msg.message == kMsgSettingsChanged) {
                 UpdateHotkeyRegistration();
+                UpdateGameModeTracking();
                 continue;
             }
         }
@@ -1919,6 +2065,12 @@ DWORD WINAPI HookThreadProc(LPVOID) {
     }
 
     UnregisterHotKey(nullptr, kHotkeyId);
+    for (HWINEVENTHOOK& h : g_winEventHooks) {
+        if (h) {
+            UnhookWinEvent(h);
+            h = nullptr;
+        }
+    }
     UnhookWindowsHookEx(g_hook);
     g_hook = nullptr;
 
@@ -2055,7 +2207,18 @@ void WhTool_ModUninit() {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// Tool mod boilerplate
+// Windhawk tool mod implementation for mods which don't need to inject to other
+// processes or hook other functions. Context:
+// https://github.com/ramensoftware/windhawk/wiki/Mods-as-tools:-Running-mods-in-a-dedicated-process
+//
+// The mod will load and run in a dedicated windhawk.exe process.
+//
+// Paste the code below as part of the mod code, and use these callbacks:
+// * WhTool_ModInit
+// * WhTool_ModSettingsChanged
+// * WhTool_ModUninit
+//
+// Currently, other callbacks are not supported.
 
 bool g_isToolModProcessLauncher;
 HANDLE g_toolModProcessMutex;
@@ -2066,6 +2229,15 @@ void WINAPI EntryPoint_Hook() {
 }
 
 BOOL Wh_ModInit() {
+    // Never run in session 0 (services / non-interactive). A mouse hook and an
+    // on-screen indicator make no sense there, and Windhawk may load the mod
+    // into such processes.
+    DWORD sessionId;
+    if (ProcessIdToSessionId(GetCurrentProcessId(), &sessionId) &&
+        sessionId == 0) {
+        return FALSE;
+    }
+
     bool isExcluded = false;
     bool isToolModProcess = false;
     bool isCurrentToolModProcess = false;

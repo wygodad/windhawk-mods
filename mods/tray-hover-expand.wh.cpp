@@ -2,11 +2,11 @@
 // @id              tray-hover-expand
 // @name            Tray hover expand
 // @description     Open the hidden tray icons flyout on hover instead of clicking the chevron; optionally collapse it when the cursor leaves
-// @version         1.4.1
+// @version         1.4.2
 // @author          wygodad
 // @github          https://github.com/wygodad
 // @include         windhawk.exe
-// @compilerOptions -lole32 -loleaut32 -luuid -luiautomationcore -lshell32
+// @compilerOptions -lole32 -loleaut32 -lshell32
 // @license         MIT
 // ==/WindhawkMod==
 
@@ -298,19 +298,20 @@ static const ULONGLONG REFIND_INTERVAL_MS = 3000;
 static const ULONGLONG RECT_REFRESH_MS = 750;
 static const ULONGLONG IDLE_STATE_CHECK_MS = 500;
 
-// Cheap (pure Win32) check whether the flyout is open — no UIA calls.
-// The chevron does not support the ExpandCollapse pattern anyway, so the
-// flyout window's visibility is the only reliable state signal.
-static bool IsFlyoutOpen(const Settings& s) {
+// Cheap (pure Win32) resolution of the flyout window — no UIA calls. The
+// chevron does not support the ExpandCollapse pattern anyway, so the flyout
+// window's visibility is the only reliable state signal. Returns the window
+// handle if the flyout is open, or nullptr otherwise. Resolving the handle
+// once per tick lets callers reuse it instead of each calling FindWindowW.
+static HWND GetVisibleFlyout(const Settings& s) {
     HWND f = FindWindowW(s.flyoutClass.c_str(), nullptr);
-    return f && IsWindowVisible(f);
+    return (f && IsWindowVisible(f)) ? f : nullptr;
 }
 
-static bool CursorOverFlyout(POINT pt, const Settings& s) {
-    HWND f = FindWindowW(s.flyoutClass.c_str(), nullptr);
-    if (!f || !IsWindowVisible(f)) return false;
+static bool PtOverWindow(HWND hwnd, POINT pt) {
+    if (!hwnd) return false;
     RECT r;
-    if (!GetWindowRect(f, &r)) return false;
+    if (!GetWindowRect(hwnd, &r)) return false;
     return PtInRect(&r, pt);
 }
 
@@ -349,13 +350,20 @@ static DWORD WINAPI WorkerThread(LPVOID) {
         if (g_settingsGeneration != settingsGen) {
             s = GetSettingsSnapshot();
             settingsGen = g_settingsGeneration;
-            nextRefind = 0;             // settings may change how we detect things
+            // Settings may change how the chevron is detected, so drop the
+            // cached element and re-detect promptly with the new settings.
+            if (pBtn) { pBtn->Release(); pBtn = nullptr; }
+            haveRect = false;
+            nextRefind = 0;
         }
 
-        // Expensive and RARE: refresh the button reference (the taskbar may
-        // have been rebuilt).
-        if (!pBtn || now >= nextRefind) {
-            if (pBtn) { pBtn->Release(); pBtn = nullptr; }
+        // Lazily (re-)find the button only when we don't have a valid one. A
+        // destroyed or stale element makes the rectangle query below fail,
+        // which clears pBtn and triggers a prompt re-find — so there is no need
+        // for a periodic cross-process subtree walk while the element is valid.
+        // When the chevron is absent (e.g. no hidden icons), throttle retries
+        // to REFIND_INTERVAL_MS instead of walking the tree every tick.
+        if (!pBtn && now >= nextRefind) {
             pBtn = FindOverflowButton(pAuto, s);
             nextRefind = now + REFIND_INTERVAL_MS;
             nextRectRefresh = 0;        // force a fresh rectangle below
@@ -370,7 +378,10 @@ static DWORD WINAPI WorkerThread(LPVOID) {
                     cachedRect = r;
                     haveRect = true;
                 } else {
+                    // The element is stale/destroyed (taskbar rebuilt). Drop it
+                    // and re-find promptly on the next tick.
                     pBtn->Release(); pBtn = nullptr; haveRect = false;
+                    nextRefind = 0;
                     WaitForSingleObject(g_stopEvent, s.pollInterval);
                     continue;
                 }
@@ -390,13 +401,14 @@ static DWORD WINAPI WorkerThread(LPVOID) {
             // watching an open flyout. When idle, throttle the check so a
             // manually opened flyout is still noticed without paying a
             // FindWindowW call on every tick.
-            bool flyoutVisible = false;
+            HWND flyoutHwnd = nullptr;
             if (enterEdge || (s.autoClose && flyoutBelievedOpen)) {
-                flyoutVisible = IsFlyoutOpen(s);
+                flyoutHwnd = GetVisibleFlyout(s);
             } else if (s.autoClose && now >= nextIdleStateCheck) {
-                flyoutVisible = IsFlyoutOpen(s);
+                flyoutHwnd = GetVisibleFlyout(s);
                 nextIdleStateCheck = now + IDLE_STATE_CHECK_MS;
             }
+            bool flyoutVisible = (flyoutHwnd != nullptr);
             flyoutBelievedOpen = flyoutVisible || cooling;
 
             // Open only on the cursor-enter edge and only when the flyout is
@@ -420,7 +432,7 @@ static DWORD WINAPI WorkerThread(LPVOID) {
                               (GetAsyncKeyState(VK_RBUTTON) & 0x8000) ||
                               (GetAsyncKeyState(VK_MBUTTON) & 0x8000);
             if (anyBtnDown && !anyBtnDownPrev && flyoutVisible &&
-                CursorOverFlyout(pt, s)) {
+                PtOverWindow(flyoutHwnd, pt)) {
                 clickedInFlyout = true;
                 Wh_Log(L"Click inside flyout: auto-collapse suspended");
             }
@@ -431,7 +443,7 @@ static DWORD WINAPI WorkerThread(LPVOID) {
 
             // Auto-collapse once the cursor left both the button and the flyout.
             if (s.autoClose && flyoutVisible && !cooling && !clickedInFlyout) {
-                bool overFlyout = CursorOverFlyout(pt, s);
+                bool overFlyout = PtOverWindow(flyoutHwnd, pt);
                 if (overBtn || overFlyout) {
                     leftAt = 0;
                 } else if (leftAt == 0) {
@@ -539,7 +551,18 @@ void WhTool_ModUninit() {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// Tool mod boilerplate
+// Windhawk tool mod implementation for mods which don't need to inject to other
+// processes or hook other functions. Context:
+// https://github.com/ramensoftware/windhawk/wiki/Mods-as-tools:-Running-mods-in-a-dedicated-process
+//
+// The mod will load and run in a dedicated windhawk.exe process.
+//
+// Paste the code below as part of the mod code, and use these callbacks:
+// * WhTool_ModInit
+// * WhTool_ModSettingsChanged
+// * WhTool_ModUninit
+//
+// Currently, other callbacks are not supported.
 
 bool g_isToolModProcessLauncher;
 HANDLE g_toolModProcessMutex;
@@ -550,6 +573,12 @@ void WINAPI EntryPoint_Hook() {
 }
 
 BOOL Wh_ModInit() {
+    DWORD sessionId;
+    if (ProcessIdToSessionId(GetCurrentProcessId(), &sessionId) &&
+        sessionId == 0) {
+        return FALSE;
+    }
+
     bool isExcluded = false;
     bool isToolModProcess = false;
     bool isCurrentToolModProcess = false;
